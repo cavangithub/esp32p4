@@ -11,9 +11,26 @@
 #include "bsp/display.h"
 #include "bsp_board_extra.h"
 #include "lv_demos.h"
+#include "time_service.h"
+#include "ui_clock.h"
+
+//-------------------------------------------------------------//
+extern int wifi_connected;
+
+//-------------------------------------------------------------//
+void demo_widgets(void);
+void init_wifi(void);
+
 
 void app_main(void)
 {
+    init_wifi();
+    if (wifi_connected) {
+        time_service_init();
+        time_service_wait_sync(
+            30000
+        );
+    }
 
 /*
 If you need to use the three-cache anti-tear configuration, you need to fix idf 5.5. Refer to: https://github.com/espressif/esp-iot-solution/blob/da973d162cc88736a4e05e6582393e666f221c2a/components/display/tools/esp_lvgl_adapter/README.md?plain=1#L671-L709 
@@ -31,10 +48,27 @@ If you need to use the three-cache anti-tear configuration, you need to fix idf 
     bsp_display_backlight_on();
 
     bsp_display_lock(-1);
+    ui_clock_create(lv_screen_active());
+    bsp_display_unlock();
 
     // lv_demo_music();
     // lv_demo_benchmark();
-    lv_demo_widgets();
+    // lv_demo_widgets();
+    // demo_widgets();
+}
 
-    bsp_display_unlock();
+void demo_widgets(void)
+{
+    lv_obj_t *label;
+
+    label = lv_label_create(
+        lv_screen_active()
+    );
+
+    lv_label_set_text(
+        label,
+        "Hello ESP32-P4"
+    );
+
+    lv_obj_center(label);
 }
