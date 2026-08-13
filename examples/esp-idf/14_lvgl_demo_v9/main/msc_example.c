@@ -5,7 +5,9 @@
  */
 
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
+#include <strings.h>
 #include <assert.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -14,7 +16,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "usb/usb_host.h"
@@ -27,9 +28,11 @@ static const char *TAG = "example";
 
 #define MNT_PATH         "/usb"     // Base mount path prefix, devices will be mounted as /usb0, /usb1, /usb2...
 #define APP_QUIT_PIN     GPIO_NUM_0 // BOOT button on most boards
-#define BUFFER_SIZE      4096       // The read/write performance can be improved with larger buffer for the cost of RAM, 4kB is enough for most usecases
 #define MAX_MSC_DEVICES  CONFIG_FATFS_VOLUME_COUNT /*!< Maximum number of simultaneously connected MSC (Mass Storage Class) devices.
                                          Adjust this value based on available system resources and expected use cases. */
+#define JPG_LIST_MAX     16
+#define JPG_PATH_MAX     256
+#define JPG_SCAN_MAX_DEPTH 8
 
 /**
  * @brief MSC Device Entry
@@ -44,6 +47,14 @@ typedef struct {
 } msc_dev_entry_t;
 
 static msc_dev_entry_t *msc_devices[MAX_MSC_DEVICES] = {0};
+
+typedef struct jpg_node {
+    char path[JPG_PATH_MAX];
+    struct jpg_node *next;
+} jpg_node_t;
+
+static jpg_node_t *s_jpg_head;
+static size_t s_jpg_count;
 
 /**
  * @brief Application Queue and its messages ID
@@ -118,7 +129,7 @@ static esp_err_t allocate_new_msc_device(const app_message_t *msg, int *out_slot
 
     const esp_vfs_fat_mount_config_t mount_config = {
         .format_if_mount_failed = false,
-        .max_files = 3,
+        .max_files = 12,
         .allocation_unit_size = 8192,
     };
 
@@ -194,6 +205,112 @@ static void free_all_msc_devices(void)
             free_msc_device(i);
         }
     }
+}
+
+static void jpg_list_clear(void)
+{
+    jpg_node_t *node = s_jpg_head;
+    while (node) {
+        jpg_node_t *next = node->next;
+        free(node);
+        node = next;
+    }
+    s_jpg_head = NULL;
+    s_jpg_count = 0;
+}
+
+static bool jpg_list_append(const char *path)
+{
+    if (s_jpg_count >= JPG_LIST_MAX) {
+        return false;
+    }
+
+    jpg_node_t *node = calloc(1, sizeof(jpg_node_t));
+    if (!node) {
+        ESP_LOGE(TAG, "Failed to allocate jpg list node");
+        return false;
+    }
+    strlcpy(node->path, path, sizeof(node->path));
+
+    if (!s_jpg_head) {
+        s_jpg_head = node;
+    } else {
+        jpg_node_t *tail = s_jpg_head;
+        while (tail->next) {
+            tail = tail->next;
+        }
+        tail->next = node;
+    }
+    s_jpg_count++;
+    return true;
+}
+
+static bool is_jpg_name(const char *name)
+{
+    size_t len = strlen(name);
+    if (len < 4) {
+        return false;
+    }
+    return strcasecmp(name + len - 4, ".jpg") == 0;
+}
+
+static void scan_jpg_dir(const char *dir, int depth)
+{
+    if (s_jpg_count >= JPG_LIST_MAX || depth > JPG_SCAN_MAX_DEPTH) {
+        return;
+    }
+
+    DIR *dh = opendir(dir);
+    if (!dh) {
+        ESP_LOGW(TAG, "Failed to open directory: %s", dir);
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dh)) != NULL && s_jpg_count < JPG_LIST_MAX) {
+        if (ent->d_name[0] == '.') {
+            continue;
+        }
+
+        char full[JPG_PATH_MAX];
+        int n = snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+        if (n < 0 || n >= (int)sizeof(full)) {
+            continue;
+        }
+
+        bool is_dir = false;
+        if (ent->d_type == DT_DIR) {
+            is_dir = true;
+        } else if (ent->d_type == DT_REG) {
+            is_dir = false;
+        } else {
+            struct stat st;
+            if (stat(full, &st) != 0) {
+                continue;
+            }
+            is_dir = S_ISDIR(st.st_mode);
+        }
+
+        if (is_dir) {
+            scan_jpg_dir(full, depth + 1);
+        } else if (is_jpg_name(ent->d_name)) {
+            if (jpg_list_append(full)) {
+                ESP_LOGI(TAG, "JPG[%u]: %s", (unsigned)s_jpg_count, full);
+            }
+        }
+    }
+    closedir(dh);
+}
+
+static void jpg_list_scan_mount(int slot)
+{
+    char mount_path[16];
+    snprintf(mount_path, sizeof(mount_path), MNT_PATH "%d", slot);
+
+    jpg_list_clear();
+    ESP_LOGI(TAG, "Scanning %s for .jpg files (max %d)", mount_path, JPG_LIST_MAX);
+    scan_jpg_dir(mount_path, 0);
+    ESP_LOGI(TAG, "JPG list count: %u", (unsigned)s_jpg_count);
 }
 
 /**
@@ -296,124 +413,6 @@ static void print_device_info(msc_host_device_info_t *info)
 }
 
 /**
- * @brief Perform basic file operations on the mounted USB storage device.
- *
- * This function demonstrates basic file I/O operations:
- *  - Create a directory `/usb<slot>/esp` if it does not exist.
- *  - Create a file `test.txt` in the directory with sample content if it does not exist.
- *  - Read the content of the `test.txt` file and print it to the console.
- *
- * @param[in] slot Index of the mounted USB device (0 to MAX_MSC_DEVICES-1).
- */
-static void file_operations(int slot)
-{
-    char directory[32];
-    char file_path[32];
-    snprintf(directory, sizeof(directory), MNT_PATH "%d/esp", slot);
-    snprintf(file_path, sizeof(file_path), MNT_PATH "%d/esp/test.txt", slot);
-
-    // Create /usb<slot>/esp directory
-    struct stat s = {0};
-    bool directory_exists = stat(directory, &s) == 0;
-    if (!directory_exists) {
-        if (mkdir(directory, 0775) != 0) {
-            ESP_LOGE(TAG, "mkdir failed with errno: %s", strerror(errno));
-        }
-    }
-
-    // Create /usb<slot>/esp/test.txt file, if it doesn't exist
-    if (stat(file_path, &s) != 0) {
-        ESP_LOGI(TAG, "Creating file");
-        FILE *f = fopen(file_path, "w");
-        if (f == NULL) {
-            ESP_LOGE(TAG, "Failed to open file for writing");
-            return;
-        }
-        fprintf(f, "Hello World!\n");
-        fclose(f);
-    }
-
-    // Read back the file
-    FILE *f;
-    ESP_LOGI(TAG, "Reading file");
-    f = fopen(file_path, "r");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for reading");
-        return;
-    }
-    char line[64];
-    fgets(line, sizeof(line), f);
-    fclose(f);
-    // strip newline
-    char *pos = strchr(line, '\n');
-    if (pos) {
-        *pos = '\0';
-    }
-    ESP_LOGI(TAG, "Read from file '%s': '%s'", file_path, line);
-}
-
-/**
- * @brief Perform sequential write and read speed test on the mounted USB storage device.
- *
- * This function performs:
- *  - A write speed test by writing a series of 4KB blocks to a test file.
- *  - A read speed test by reading the same number of 4KB blocks from the file.
- *
- * The results (in MiB/s) are printed to the console.
- *
- * @param[in] slot Index of the mounted USB device (0 to MAX_MSC_DEVICES-1).
- */
-static void speed_test(int slot)
-{
-#define ITERATIONS  256  // 256 * 4kb = 1MB
-    int64_t test_start, test_end;
-    char test_file[32];
-    snprintf(test_file, sizeof(test_file), MNT_PATH "%d/esp/dummy", slot);
-
-    FILE *f = fopen(test_file, "wb+");
-    if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
-        return;
-    }
-    // Set larger buffer for this file. It results in larger and more effective USB transfers
-    setvbuf(f, NULL, _IOFBF, BUFFER_SIZE);
-
-    // Allocate application buffer used for read/write
-    uint8_t *data = malloc(BUFFER_SIZE);
-    assert(data);
-
-    ESP_LOGI(TAG, "Writing to file %s", test_file);
-    test_start = esp_timer_get_time();
-    for (int i = 0; i < ITERATIONS; i++) {
-        if (fwrite(data, BUFFER_SIZE, 1, f) == 0) {
-            ESP_LOGE(TAG, "Write error");
-            fclose(f);
-            free(data);
-            return;
-        }
-    }
-    test_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "Write speed %1.2f MiB/s", (BUFFER_SIZE * ITERATIONS) / (float)(test_end - test_start));
-    rewind(f);
-
-    ESP_LOGI(TAG, "Reading from file %s", test_file);
-    test_start = esp_timer_get_time();
-    for (int i = 0; i < ITERATIONS; i++) {
-        if (0 == fread(data, BUFFER_SIZE, 1, f)) {
-            ESP_LOGE(TAG, "Read error");
-            fclose(f);
-            free(data);
-            return;
-        }
-    }
-    test_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "Read speed %1.2f MiB/s", (BUFFER_SIZE * ITERATIONS) / (float)(test_end - test_start));
-
-    fclose(f);
-    free(data);
-}
-
-/**
  * @brief USB task
  *
  * Install USB Host Library and MSC driver.
@@ -457,41 +456,6 @@ static void usb_task(void *args)
     vTaskDelete(NULL);
 }
 
-/**
- * @brief List contents of the root directories of all mounted USB storage devices.
- *
- * This function iterates over all mounted MSC devices and lists the contents
- * of their root directories. It is intended for debugging and demonstration purposes.
- *
- * For each connected and mounted device, the function attempts to open the root directory
- * `/usb<slot>` and print the names of all files and directories contained within.
- *
- * If opening the directory fails, an error is logged.
- */
-static inline void show_list_files_all_devices(void)
-{
-    ESP_LOGI(TAG, "ls command output for all connected devices:");
-    for (int i = 0; i < MAX_MSC_DEVICES; i++) {
-        if (msc_devices[i]) {
-            char mount_path[16];
-            snprintf(mount_path, sizeof(mount_path), MNT_PATH "%d", i);
-
-            ESP_LOGI(TAG, "Listing contents of %s", mount_path);
-            struct dirent *d;
-            DIR *dh = opendir(mount_path);
-            if (!dh) {
-                ESP_LOGE(TAG, "Failed to open directory: %s", mount_path);
-                continue;
-            }
-
-            while ((d = readdir(dh)) != NULL) {
-                printf("%s/%s\n", mount_path, d->d_name);
-            }
-            closedir(dh);
-        }
-    }
-}
-
 void msc_loop(void)
 {
     // Create FreeRTOS primitives
@@ -532,24 +496,20 @@ void msc_loop(void)
             msc_host_print_descriptors(msc_devices[slot]->msc_device);
             print_device_info(&info);
 
-            // 3. List all the files in root directory from all connected msc devices
-            show_list_files_all_devices();
+            jpg_list_scan_mount(slot);
 
-            // 4. The disk is mounted to Virtual File System, perform some basic demo file operation
-            file_operations(slot);
-
-            // 5. Perform speed test
-            speed_test(slot);
-
-            ESP_LOGI(TAG, "Example finished, you can disconnect the USB flash drive (or connect another USB flash drive)");
+            ESP_LOGI(TAG, "Scan finished, you can disconnect the USB flash drive (or connect another USB flash drive)");
         }
         if (msg.id == APP_DEVICE_DISCONNECTED) {
             int slot = find_slot_by_handle(msg.data.device_handle);
             if (slot >= 0) {
+                jpg_list_clear();
+                ESP_LOGI(TAG, "USB removed, JPG list count: %u", (unsigned)s_jpg_count);
                 free_msc_device(slot);
             }
         }
         if (msg.id == APP_QUIT) {
+            jpg_list_clear();
             free_all_msc_devices();
             msc_host_uninstall();
             break;

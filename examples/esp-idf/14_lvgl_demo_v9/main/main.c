@@ -13,6 +13,7 @@
 #include "lv_demos.h"
 #include "time_service.h"
 #include "ui_clock.h"
+#include "ui_image.h"
 
 //-------------------------------------------------------------//
 extern int wifi_connected;
@@ -49,7 +50,9 @@ If you need to use the three-cache anti-tear configuration, you need to fix idf 
     bsp_display_backlight_on();
 
     bsp_display_lock(-1);
-    ui_clock_create(lv_screen_active());
+    lv_obj_t *page = photo_page_create();
+    lv_screen_load(page);
+    photo_show("S:/1.jpg");
     bsp_display_unlock();
 
     // lv_demo_music();

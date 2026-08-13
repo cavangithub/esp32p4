@@ -3,7 +3,7 @@ file(GLOB_RECURSE LV_DEMOS_SOURCES ${LV_DEMO_DIR}/*.c)
 
 idf_component_register(
     # ${LV_DEMOS_SOURCES}
-    SRCS main.c station_example.c time_service.c ui_clock.c msc_example.c
+    SRCS main.c station_example.c time_service.c ui_clock.c ui_image.c msc_example.c
 
     # ${LV_DEMO_DIR}
     INCLUDE_DIRS . )
