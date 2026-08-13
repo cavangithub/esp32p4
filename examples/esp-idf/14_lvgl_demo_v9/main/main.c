@@ -1,37 +1,28 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
-#include "nvs.h"
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_check.h"
-#include "esp_memory_utils.h"
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "bsp_board_extra.h"
-#include "lv_demos.h"
 #include "time_service.h"
-#include "ui_clock.h"
 #include "ui_image.h"
+#include "album_ctrl.h"
+#include "msc_example.h"
 
-//-------------------------------------------------------------//
+static const char *TAG = "main";
+
 extern int wifi_connected;
 
-//-------------------------------------------------------------//
-void demo_widgets(void);
 void init_wifi(void);
-void msc_loop(void);
-
 
 void app_main(void)
 {
     init_wifi();
     if (wifi_connected) {
         time_service_init();
-        time_service_wait_sync(
-            30000
-        );
+        time_service_wait_sync(30000);
     }
 
 /*
@@ -52,28 +43,26 @@ If you need to use the three-cache anti-tear configuration, you need to fix idf 
     bsp_display_lock(-1);
     lv_obj_t *page = photo_page_create();
     lv_screen_load(page);
-    photo_show("S:/1.jpg");
+    album_ctrl_init();
     bsp_display_unlock();
 
-    // lv_demo_music();
-    // lv_demo_benchmark();
-    // lv_demo_widgets();
-    // demo_widgets();
-    msc_loop();
-}
+    ESP_ERROR_CHECK(msc_start());
 
-void demo_widgets(void)
-{
-    lv_obj_t *label;
+    /* Main owns UI updates: wait for USB events from msc_task */
+    while (true) {
+        msc_event_t evt;
+        if (!msc_wait_event(&evt, portMAX_DELAY)) {
+            continue;
+        }
 
-    label = lv_label_create(
-        lv_screen_active()
-    );
+        ESP_LOGI(TAG, "MSC event %d, jpg_count=%u", (int)evt.id, (unsigned)evt.jpg_count);
 
-    lv_label_set_text(
-        label,
-        "Hello ESP32-P4"
-    );
-
-    lv_obj_center(label);
+        bsp_display_lock(-1);
+        if (evt.id == MSC_EVENT_CONNECTED) {
+            album_ctrl_on_usb_ready();
+        } else if (evt.id == MSC_EVENT_DISCONNECTED) {
+            album_ctrl_on_usb_removed();
+        }
+        bsp_display_unlock();
+    }
 }

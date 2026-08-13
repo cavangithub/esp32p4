@@ -8,7 +8,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <strings.h>
-#include <assert.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <inttypes.h>
@@ -22,15 +21,12 @@
 #include "usb/msc_host_vfs.h"
 #include "ffconf.h"
 #include "errno.h"
-#include "driver/gpio.h"
+#include "msc_example.h"
 
-static const char *TAG = "example";
+static const char *TAG = "msc";
 
 #define MNT_PATH         "/usb"     // Base mount path prefix, devices will be mounted as /usb0, /usb1, /usb2...
-#define APP_QUIT_PIN     GPIO_NUM_0 // BOOT button on most boards
-#define MAX_MSC_DEVICES  CONFIG_FATFS_VOLUME_COUNT /*!< Maximum number of simultaneously connected MSC (Mass Storage Class) devices.
-                                         Adjust this value based on available system resources and expected use cases. */
-#define JPG_LIST_MAX     16
+#define MAX_MSC_DEVICES  CONFIG_FATFS_VOLUME_COUNT
 #define JPG_PATH_MAX     256
 #define JPG_SCAN_MAX_DEPTH 8
 
@@ -48,29 +44,45 @@ typedef struct {
 
 static msc_dev_entry_t *msc_devices[MAX_MSC_DEVICES] = {0};
 
-typedef struct jpg_node {
-    char path[JPG_PATH_MAX];
-    struct jpg_node *next;
-} jpg_node_t;
-
-static jpg_node_t *s_jpg_head;
+static char s_jpg_paths[JPG_LIST_MAX][JPG_PATH_MAX];
 static size_t s_jpg_count;
+static bool s_jpg_ready;
+
+size_t jpg_list_count(void)
+{
+    return s_jpg_count;
+}
+
+const char *jpg_list_get(size_t index)
+{
+    if (index >= s_jpg_count) {
+        return NULL;
+    }
+    return s_jpg_paths[index];
+}
+
+bool jpg_list_ready(void)
+{
+    return s_jpg_ready;
+}
 
 /**
- * @brief Application Queue and its messages ID
+ * @brief Internal MSC host queue (connect/disconnect from USB callback)
+ *        and notify queue (events delivered to main).
  */
-static QueueHandle_t app_queue;
+static QueueHandle_t s_host_queue;
+static QueueHandle_t s_notify_queue;
+
 typedef struct {
     enum {
-        APP_QUIT,                // Signals request to exit the application
-        APP_DEVICE_CONNECTED,    // USB device connect event
-        APP_DEVICE_DISCONNECTED, // USB device disconnect event
+        HOST_DEVICE_CONNECTED,
+        HOST_DEVICE_DISCONNECTED,
     } id;
     union {
-        uint8_t new_dev_address; // Address of new USB device for APP_DEVICE_CONNECTED event
-        msc_host_device_handle_t device_handle; // Handle of removed USB device for APP_DEVICE_DISCONNECTED event
+        uint8_t new_dev_address;
+        msc_host_device_handle_t device_handle;
     } data;
-} app_message_t;
+} host_message_t;
 
 /**
  * @brief Find a free slot in the device table.
@@ -104,7 +116,7 @@ static inline int find_free_slot(void)
  *         - ESP_ERR_NO_MEM if memory allocation fails.
  *         - Other esp_err_t codes if device installation or VFS registration fails.
  */
-static esp_err_t allocate_new_msc_device(const app_message_t *msg, int *out_slot)
+static esp_err_t allocate_new_msc_device(const host_message_t *msg, int *out_slot)
 {
     int slot = find_free_slot();
     if (slot < 0) {
@@ -169,11 +181,6 @@ static int find_slot_by_handle(msc_host_device_handle_t handle)
 
 /**
  * @brief Free resources associated with a specific MSC device by slot index.
- *
- * This function releases all resources associated with a device identified by its slot index.
- * It unmounts the VFS, uninstalls the MSC device, and frees the allocated memory.
- *
- * @param slot Index of the MSC device in the device array.
  */
 static void free_msc_device(int slot)
 {
@@ -193,30 +200,25 @@ static void free_msc_device(int slot)
     msc_devices[slot] = NULL;
 }
 
-/**
- * @brief Free all connected MSC devices.
- *
- * Iterates over all allocated MSC devices, unmounts them from VFS, and frees their memory.
- */
-static void free_all_msc_devices(void)
+static void notify_main(msc_event_id_t id)
 {
-    for (int i = 0; i < MAX_MSC_DEVICES; i++) {
-        if (msc_devices[i]) {
-            free_msc_device(i);
-        }
+    if (!s_notify_queue) {
+        return;
+    }
+    msc_event_t evt = {
+        .id = id,
+        .jpg_count = s_jpg_count,
+    };
+    if (xQueueSend(s_notify_queue, &evt, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Failed to notify main (event=%d)", (int)id);
     }
 }
 
 static void jpg_list_clear(void)
 {
-    jpg_node_t *node = s_jpg_head;
-    while (node) {
-        jpg_node_t *next = node->next;
-        free(node);
-        node = next;
-    }
-    s_jpg_head = NULL;
     s_jpg_count = 0;
+    s_jpg_ready = false;
+    memset(s_jpg_paths, 0, sizeof(s_jpg_paths));
 }
 
 static bool jpg_list_append(const char *path)
@@ -224,23 +226,7 @@ static bool jpg_list_append(const char *path)
     if (s_jpg_count >= JPG_LIST_MAX) {
         return false;
     }
-
-    jpg_node_t *node = calloc(1, sizeof(jpg_node_t));
-    if (!node) {
-        ESP_LOGE(TAG, "Failed to allocate jpg list node");
-        return false;
-    }
-    strlcpy(node->path, path, sizeof(node->path));
-
-    if (!s_jpg_head) {
-        s_jpg_head = node;
-    } else {
-        jpg_node_t *tail = s_jpg_head;
-        while (tail->next) {
-            tail = tail->next;
-        }
-        tail->next = node;
-    }
+    strlcpy(s_jpg_paths[s_jpg_count], path, JPG_PATH_MAX);
     s_jpg_count++;
     return true;
 }
@@ -311,36 +297,13 @@ static void jpg_list_scan_mount(int slot)
     ESP_LOGI(TAG, "Scanning %s for .jpg files (max %d)", mount_path, JPG_LIST_MAX);
     scan_jpg_dir(mount_path, 0);
     ESP_LOGI(TAG, "JPG list count: %u", (unsigned)s_jpg_count);
-}
 
-/**
- * @brief BOOT button pressed callback
- *
- * Signal application to exit the main task
- *
- * @param[in] arg Unused
- */
-static void gpio_cb(void *arg)
-{
-    BaseType_t xTaskWoken = pdFALSE;
-    app_message_t message = {
-        .id = APP_QUIT,
-    };
-
-    if (app_queue) {
-        xQueueSendFromISR(app_queue, &message, &xTaskWoken);
-    }
-
-    if (xTaskWoken == pdTRUE) {
-        portYIELD_FROM_ISR();
-    }
+    s_jpg_ready = true;
+    notify_main(MSC_EVENT_CONNECTED);
 }
 
 /**
  * @brief Find a USB addr by MSC device handle.
- *
- * @param handle MSC device handle
- * @return USB addr, or -1 if not found.
  */
 static inline int8_t find_usb_addr_by_handle(msc_host_device_handle_t handle)
 {
@@ -353,22 +316,22 @@ static inline int8_t find_usb_addr_by_handle(msc_host_device_handle_t handle)
 }
 
 /**
- * @brief MSC driver callback
- *
- * Signal device connection/disconnection to the main task
- *
- * @param[in] event MSC event
- * @param[in] arg   MSC event data
+ * @brief MSC driver callback — post to host queue (handled by msc_task).
  */
 static void msc_event_cb(const msc_host_event_t *event, void *arg)
 {
+    (void)arg;
+    if (!s_host_queue) {
+        return;
+    }
+
     if (event->event == MSC_DEVICE_CONNECTED) {
         ESP_LOGI(TAG, "MSC device connected (usb_addr=%d)", event->device.address);
-        app_message_t message = {
-            .id = APP_DEVICE_CONNECTED,
+        host_message_t message = {
+            .id = HOST_DEVICE_CONNECTED,
             .data.new_dev_address = event->device.address,
         };
-        xQueueSend(app_queue, &message, portMAX_DELAY);
+        xQueueSend(s_host_queue, &message, portMAX_DELAY);
     } else if (event->event == MSC_DEVICE_DISCONNECTED) {
         int usb_addr = find_usb_addr_by_handle(event->device.handle);
         if (usb_addr >= 0) {
@@ -376,24 +339,16 @@ static void msc_event_cb(const msc_host_event_t *event, void *arg)
         } else {
             ESP_LOGW(TAG, "MSC device disconnected, but failed to retrieve USB address");
         }
-        app_message_t message = {
-            .id = APP_DEVICE_DISCONNECTED,
+        host_message_t message = {
+            .id = HOST_DEVICE_DISCONNECTED,
             .data.device_handle = event->device.handle,
         };
-        xQueueSend(app_queue, &message, portMAX_DELAY);
+        xQueueSend(s_host_queue, &message, portMAX_DELAY);
     } else {
         ESP_LOGW(TAG, "Unsupported MSC event: %d (possibly suspend/resume)", event->event);
     }
 }
 
-/**
- * @brief Print information about the connected MSC device.
- *
- * This function prints detailed information about the connected USB MSC device,
- * such as capacity, sector size, PID, VID, and string descriptors.
- *
- * @param[in] info Pointer to MSC device information structure.
- */
 static void print_device_info(msc_host_device_info_t *info)
 {
     const size_t megabyte = 1024 * 1024;
@@ -413,15 +368,11 @@ static void print_device_info(msc_host_device_info_t *info)
 }
 
 /**
- * @brief USB task
- *
- * Install USB Host Library and MSC driver.
- * Handle USB Host Library events
- *
- * @param[in] args Unused
+ * @brief USB host library task — keep handling host events.
  */
 static void usb_task(void *args)
 {
+    (void)args;
     const usb_host_config_t host_config = { .intr_flags = ESP_INTR_FLAG_LEVEL1 };
     ESP_ERROR_CHECK(usb_host_install(&host_config));
 
@@ -433,91 +384,95 @@ static void usb_task(void *args)
     };
     ESP_ERROR_CHECK(msc_host_install(&msc_config));
 
-    bool has_clients = true;
     while (true) {
         uint32_t event_flags;
         usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
-
-        // Release devices once all clients has deregistered
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
-            has_clients = false;
-            if (usb_host_device_free_all() == ESP_OK) {
-                break;
-            };
-        }
-        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE && !has_clients) {
-            break;
+            ESP_LOGW(TAG, "USB host: no clients");
         }
     }
-
-    vTaskDelay(10); // Give clients some time to uninstall
-    ESP_LOGI(TAG, "Deinitializing USB");
-    ESP_ERROR_CHECK(usb_host_uninstall());
-    vTaskDelete(NULL);
 }
 
-void msc_loop(void)
+/**
+ * @brief MSC worker — mount/scan on connect, clear on disconnect, notify main.
+ */
+static void msc_task(void *args)
 {
-    // Create FreeRTOS primitives
-    app_queue = xQueueCreate(5, sizeof(app_message_t));
-    assert(app_queue);
+    (void)args;
+    ESP_LOGI(TAG, "MSC task waiting for USB flash drive");
 
-    BaseType_t task_created = xTaskCreate(usb_task, "usb_task", 4096, NULL, 2, NULL);
-    assert(task_created);
+    while (true) {
+        host_message_t msg;
+        if (xQueueReceive(s_host_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
 
-    // Init BOOT button: Pressing the button simulates app request to exit
-    // It will disconnect the USB device and uninstall the MSC drivers and USB Host Lib
-    const gpio_config_t input_pin = {
-        .pin_bit_mask = BIT64(APP_QUIT_PIN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&input_pin));
-    ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(APP_QUIT_PIN, gpio_cb, NULL));
-
-    ESP_LOGI(TAG, "Waiting for USB flash drive to be connected");
-
-    // Perform all example operations in a loop to allow USB reconnections
-    while (1) {
-        app_message_t msg;
-        xQueueReceive(app_queue, &msg, portMAX_DELAY);
-
-        if (msg.id == APP_DEVICE_CONNECTED) {
+        if (msg.id == HOST_DEVICE_CONNECTED) {
             int slot;
             esp_err_t res = allocate_new_msc_device(&msg, &slot);
             if (res != ESP_OK) {
                 continue;
             }
-            // 2. Print information about the connected disk
+
             msc_host_device_info_t info;
             ESP_ERROR_CHECK(msc_host_get_device_info(msc_devices[slot]->msc_device, &info));
             msc_host_print_descriptors(msc_devices[slot]->msc_device);
             print_device_info(&info);
 
             jpg_list_scan_mount(slot);
-
-            ESP_LOGI(TAG, "Scan finished, you can disconnect the USB flash drive (or connect another USB flash drive)");
-        }
-        if (msg.id == APP_DEVICE_DISCONNECTED) {
+            ESP_LOGI(TAG, "Scan finished, notified main (count=%u)", (unsigned)s_jpg_count);
+        } else if (msg.id == HOST_DEVICE_DISCONNECTED) {
             int slot = find_slot_by_handle(msg.data.device_handle);
             if (slot >= 0) {
                 jpg_list_clear();
-                ESP_LOGI(TAG, "USB removed, JPG list count: %u", (unsigned)s_jpg_count);
+                notify_main(MSC_EVENT_DISCONNECTED);
+                /* Give main a moment to clear lv_image src before unmount */
+                vTaskDelay(pdMS_TO_TICKS(50));
                 free_msc_device(slot);
+                ESP_LOGI(TAG, "USB removed, notified main");
             }
         }
-        if (msg.id == APP_QUIT) {
-            jpg_list_clear();
-            free_all_msc_devices();
-            msc_host_uninstall();
-            break;
-        }
+    }
+}
+
+esp_err_t msc_start(void)
+{
+    if (s_host_queue || s_notify_queue) {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Done");
-    gpio_isr_handler_remove(APP_QUIT_PIN);
-    gpio_uninstall_isr_service();
-    vQueueDelete(app_queue);
+    s_host_queue = xQueueCreate(5, sizeof(host_message_t));
+    s_notify_queue = xQueueCreate(5, sizeof(msc_event_t));
+    if (!s_host_queue || !s_notify_queue) {
+        if (s_host_queue) {
+            vQueueDelete(s_host_queue);
+            s_host_queue = NULL;
+        }
+        if (s_notify_queue) {
+            vQueueDelete(s_notify_queue);
+            s_notify_queue = NULL;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t ok = xTaskCreate(usb_task, "usb_task", 4096, NULL, 2, NULL);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreate(msc_task, "msc_task", 8192, NULL, 3, NULL);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "USB MSC tasks started");
+    return ESP_OK;
+}
+
+bool msc_wait_event(msc_event_t *event, TickType_t timeout_ticks)
+{
+    if (!event || !s_notify_queue) {
+        return false;
+    }
+    return xQueueReceive(s_notify_queue, event, timeout_ticks) == pdTRUE;
 }
