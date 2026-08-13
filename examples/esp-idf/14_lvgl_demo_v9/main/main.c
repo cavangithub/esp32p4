@@ -20,6 +20,7 @@ extern int wifi_connected;
 //-------------------------------------------------------------//
 void demo_widgets(void);
 void init_wifi(void);
+void msc_loop(void);
 
 
 void app_main(void)
@@ -37,10 +38,10 @@ If you need to use the three-cache anti-tear configuration, you need to fix idf 
 */
     bsp_display_cfg_t cfg = {
         .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
-        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .rotation = ESP_LV_ADAPTER_ROTATE_90,
         .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
         .touch_flags = {
-            .swap_xy = 0,
+            .swap_xy = 1,
             .mirror_x = 0,
             .mirror_y = 0
         }};
@@ -55,6 +56,7 @@ If you need to use the three-cache anti-tear configuration, you need to fix idf 
     // lv_demo_benchmark();
     // lv_demo_widgets();
     // demo_widgets();
+    msc_loop();
 }
 
 void demo_widgets(void)
