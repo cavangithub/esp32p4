@@ -1,5 +1,50 @@
 menu "Example Configuration"
 
+    choice EXAMPLE_LCD_PANEL
+        prompt "LCD panel"
+        default EXAMPLE_LCD_PANEL_WAVESHARE
+        help
+            Select which display this example initializes. Only one MIPI-DSI
+            panel can be active at a time.
+
+        config EXAMPLE_LCD_PANEL_WAVESHARE
+            bool "Waveshare DSI LCD"
+            help
+                Use the LCD type selected under Board Support Package(ESP32-P4).
+                This example defaults to the 7-inch 720x1280 panel.
+
+        config EXAMPLE_LCD_PANEL_AMS495QA04
+            bool "Samsung AMS495QA04 4.95\" AMOLED (960x544)"
+            help
+                River-board AMOLED over MIPI-DSI. Native landscape 960x544,
+                RGB565, touchless, no backlight. Requires VDD then VCI
+                power-up and the Samsung MCS init sequence.
+    endchoice
+
+    config EXAMPLE_AMS495QA04_RST_GPIO
+        int "AMS495QA04 reset GPIO (active low)"
+        depends on EXAMPLE_LCD_PANEL_AMS495QA04
+        default 32
+        range -1 54
+        help
+            Panel RESETB. Set to -1 to use DCS software reset instead.
+
+    config EXAMPLE_AMS495QA04_VCI_EN_GPIO
+        int "AMS495QA04 VCI enable GPIO"
+        depends on EXAMPLE_LCD_PANEL_AMS495QA04
+        default 21
+        range 0 54
+        help
+            Load-switch enable for the panel +3.3 V VCI rail.
+
+    config EXAMPLE_AMS495QA04_VDD_EN_GPIO
+        int "AMS495QA04 VDD enable GPIO"
+        depends on EXAMPLE_LCD_PANEL_AMS495QA04
+        default 22
+        range 0 54
+        help
+            Load-switch enable for the panel +1.8 V VDD rail.
+
     config ESP_WIFI_SSID
         string "WiFi SSID"
         default "myssid"

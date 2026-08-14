@@ -13,9 +13,8 @@
 
 static const char *TAG = "album_ctrl";
 
-#define ALBUM_SLIDE_MS 3000
+#define ALBUM_SLIDE_MS 5000
 #define ALBUM_CLOCK_MS 1000
-#define LVGL_PATH_MAX  280
 
 static size_t s_index;
 static bool s_playing;
@@ -25,12 +24,6 @@ static lv_timer_t *s_clock_timer;
 static void album_show_current(void);
 static void slide_timer_cb(lv_timer_t *timer);
 static void clock_timer_cb(lv_timer_t *timer);
-
-static void vfs_to_lvgl_path(const char *vfs_path, char *out, size_t out_len)
-{
-    /* POSIX FS letter 'S' + absolute VFS path, e.g. S:/usb0/a.jpg */
-    snprintf(out, out_len, "S:%s", vfs_path);
-}
 
 static void clock_timer_cb(lv_timer_t *timer)
 {
@@ -55,14 +48,31 @@ static void album_stop_slideshow(void)
     }
 }
 
+static void album_start_slideshow(void)
+{
+    if (jpg_list_count() == 0) {
+        album_stop_slideshow();
+        return;
+    }
+    s_playing = true;
+    if (s_slide_timer) {
+        lv_timer_pause(s_slide_timer);
+    }
+}
+
 static void album_show_current(void)
 {
     size_t count = jpg_list_count();
     if (count == 0 || s_index >= count) {
         photo_show(NULL);
-        photo_set_status(jpg_list_ready() ? "No JPG found" : "Insert USB", NULL);
+        photo_set_status(jpg_list_ready() ? "No JPEG found" : "Insert USB", NULL);
         photo_set_play_label(false);
         return;
+    }
+
+    /* Wait until the new photo is on screen before starting the 5s timer. */
+    if (s_slide_timer) {
+        lv_timer_pause(s_slide_timer);
     }
 
     const char *vfs_path = jpg_list_get(s_index);
@@ -70,13 +80,10 @@ static void album_show_current(void)
         return;
     }
 
-    char lvgl_path[LVGL_PATH_MAX];
-    vfs_to_lvgl_path(vfs_path, lvgl_path, sizeof(lvgl_path));
-
     ESP_LOGI(TAG, "Show [%u/%u] %s",
-             (unsigned)(s_index + 1), (unsigned)count, lvgl_path);
+             (unsigned)(s_index + 1), (unsigned)count, vfs_path);
 
-    photo_show(lvgl_path);
+    photo_show(vfs_path);
 
     char status[48];
     snprintf(status, sizeof(status), "USB %u/%u",
@@ -111,7 +118,7 @@ void album_ctrl_init(void)
 void album_ctrl_on_usb_ready(void)
 {
     s_index = 0;
-    album_stop_slideshow();
+    album_start_slideshow();
     album_show_current();
 }
 
@@ -120,6 +127,15 @@ void album_ctrl_on_usb_removed(void)
     s_index = 0;
     album_stop_slideshow();
     album_show_current();
+}
+
+void album_ctrl_on_photo_shown(void)
+{
+    if (!s_playing || !s_slide_timer || jpg_list_count() == 0) {
+        return;
+    }
+    lv_timer_reset(s_slide_timer);
+    lv_timer_resume(s_slide_timer);
 }
 
 void album_ctrl_prev(void)

@@ -231,13 +231,16 @@ static bool jpg_list_append(const char *path)
     return true;
 }
 
-static bool is_jpg_name(const char *name)
+static bool is_jpeg_name(const char *name)
 {
     size_t len = strlen(name);
-    if (len < 4) {
-        return false;
+    if (len >= 5 && strcasecmp(name + len - 5, ".jpeg") == 0) {
+        return true;
     }
-    return strcasecmp(name + len - 4, ".jpg") == 0;
+    if (len >= 4 && strcasecmp(name + len - 4, ".jpg") == 0) {
+        return true;
+    }
+    return false;
 }
 
 static void scan_jpg_dir(const char *dir, int depth)
@@ -279,9 +282,9 @@ static void scan_jpg_dir(const char *dir, int depth)
 
         if (is_dir) {
             scan_jpg_dir(full, depth + 1);
-        } else if (is_jpg_name(ent->d_name)) {
+        } else if (is_jpeg_name(ent->d_name)) {
             if (jpg_list_append(full)) {
-                ESP_LOGI(TAG, "JPG[%u]: %s", (unsigned)s_jpg_count, full);
+                ESP_LOGI(TAG, "JPEG[%u]: %s", (unsigned)s_jpg_count, full);
             }
         }
     }
@@ -294,9 +297,9 @@ static void jpg_list_scan_mount(int slot)
     snprintf(mount_path, sizeof(mount_path), MNT_PATH "%d", slot);
 
     jpg_list_clear();
-    ESP_LOGI(TAG, "Scanning %s for .jpg files (max %d)", mount_path, JPG_LIST_MAX);
+    ESP_LOGI(TAG, "Scanning %s for .jpg/.jpeg files (max %d)", mount_path, JPG_LIST_MAX);
     scan_jpg_dir(mount_path, 0);
-    ESP_LOGI(TAG, "JPG list count: %u", (unsigned)s_jpg_count);
+    ESP_LOGI(TAG, "JPEG list count: %u", (unsigned)s_jpg_count);
 
     s_jpg_ready = true;
     notify_main(MSC_EVENT_CONNECTED);

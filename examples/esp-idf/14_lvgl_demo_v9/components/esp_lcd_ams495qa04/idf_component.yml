@@ -1,0 +1,7 @@
+version: "1.0.0"
+targets:
+  - esp32p4
+description: "Samsung AMS495QA04 4.95in qHD (960x544) AMOLED MIPI-DSI driver"
+dependencies:
+  idf:
+    version: '>=5.4'

@@ -13,8 +13,8 @@ extern "C" {
 #define JPG_LIST_MAX 16
 
 typedef enum {
-    MSC_EVENT_CONNECTED,    /*!< USB mounted and JPG list scanned */
-    MSC_EVENT_DISCONNECTED, /*!< USB removed and JPG list cleared */
+    MSC_EVENT_CONNECTED,    /*!< USB mounted and JPEG list scanned */
+    MSC_EVENT_DISCONNECTED, /*!< USB removed and JPEG list cleared */
 } msc_event_id_t;
 
 typedef struct {
@@ -25,7 +25,7 @@ typedef struct {
 /**
  * @brief Start USB host + MSC worker task (non-blocking).
  *
- * Worker detects connect/disconnect, mounts VFS, scans JPGs,
+ * Worker detects connect/disconnect, mounts VFS, scans JPEG files,
  * then posts @ref msc_event_t to an internal queue for main.
  */
 esp_err_t msc_start(void);

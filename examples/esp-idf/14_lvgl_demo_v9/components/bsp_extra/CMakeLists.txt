@@ -1,6 +1,7 @@
 set(SRCS "")
 list(APPEND SRCS
     "src/bsp_board_extra.c"
+    "src/bsp_display_extra.c"
 )
 
 set(INCLUDE_DIRS "")
@@ -15,7 +16,7 @@ endforeach()
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS ${INCLUDE_DIRS}
-    REQUIRES driver esp_driver_gpio esp_driver_i2s
+    REQUIRES driver esp_driver_gpio esp_driver_i2s esp_lcd esp_lcd_ams495qa04
     PRIV_REQUIRES esp_timer fatfs esp_psram esp_mm esp_driver_i2c esp_driver_ledc
 )
 
